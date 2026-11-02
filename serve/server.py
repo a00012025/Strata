@@ -304,6 +304,72 @@ SESSION_WAIT_MAX_S = 3600
 PP_CHUNK_MAX = 32768
 PP_FLOOR_TOK_S = 50.0
 PP_SLACK = 3.0
+
+
+def tool_loop_max_repeats_from_config(cfg: dict) -> int:
+    value = cfg.get("tool_loop_max_repeats", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value == 1 or value < 0:
+        raise ValueError(f'"tool_loop_max_repeats" must be 0 or a whole number >= 2, not {value!r}')
+    return value
+
+
+def _canonical_tool_args(args) -> str | None:
+    if not isinstance(args, dict):
+        return None
+    return json.dumps(args, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _actual_tool_output(output) -> str | None:
+    if not isinstance(output, str):
+        return None
+    if output.startswith(("Script running with cell ID", "Process running with session ID")):
+        return None
+    lines = output.splitlines(keepends=True)
+    if lines and lines[0].startswith("Chunk ID:"):
+        exit_line = next((line.strip() for line in lines[:6]
+                          if re.fullmatch(r"Process exited with code -?\d+", line.strip())), None)
+        if exit_line is None:
+            return None
+        index = 1
+        while index < len(lines):
+            line = lines[index].strip()
+            if not (line.startswith(("Wall time:", "Original token count:")) or line == exit_line):
+                break
+            index += 1
+        if index < len(lines) and lines[index].strip() in ("Output:", "Final output:"):
+            return exit_line + "\n" + "".join(lines[index + 1:])
+    return output
+
+
+def tool_loop_notice(messages: list[dict], max_repeats: int) -> str | None:
+    if not max_repeats:
+        return None
+    start = max((i for i, message in enumerate(messages) if message.get("role") == "user"), default=-1) + 1
+    pairs, index = [], len(messages) - 1
+    while index >= start and len(pairs) < max_repeats:
+        if index - 1 < start or messages[index].get("role") != "tool" or messages[index - 1].get("role") != "assistant":
+            break
+        calls = messages[index - 1].get("tool_calls") or []
+        if len(calls) != 1:
+            return None
+        function = calls[0].get("function") if isinstance(calls[0], dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(name, str) or name.rsplit(".", 1)[-1] == "write_stdin":
+            return None
+        args = _canonical_tool_args(function.get("arguments"))
+        output = _actual_tool_output(messages[index].get("content"))
+        if args is None or output is None:
+            return None
+        pairs.append((name, args, output))
+        index -= 2
+    if len(pairs) < max_repeats or len(set(pairs)) != 1:
+        return None
+    name = pairs[0][0]
+    return (f"Stopped by Strata no-progress guard: {max_repeats} identical {name} tool calls returned no new "
+            "progress. The task is not completed; change approach, ask the user, or set "
+            "tool_loop_max_repeats to 0 to disable this safety stop.")
+
+
 # Reads that had no timeout (#1317).  A blocking read of the image encoder's pipe or of the engine's READY line that
 # never returned held the request turn for good: the engine then sat idle in its command loop, so no watchdog could
 # fire and every later request queued behind it (the "lost step" class of #481).  Generous on purpose: a cold model
@@ -4269,6 +4335,8 @@ class Service:
         self.reasoning_budget_configured = False         # the config named reasoning_budget_tokens (0 included): no family default
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
+        self.tool_loop_max_repeats = 0
+        self.tool_loop_guard = threading.local()
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
@@ -5189,6 +5257,9 @@ class Service:
         prompt; with thinking, Service.run writes it once the thinking is over."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
+        self.tool_loop_guard.notice = tool_loop_notice(messages, self.tool_loop_max_repeats)
+        if self.tool_loop_guard.notice:
+            return [], False, max(1, int(max_new or 1))
         # Cached tool images are references in browser history, never arbitrary file paths or huge base64 strings.
         for message in messages:
             for part in message.get("content", []) if isinstance(message.get("content"), list) else []:
@@ -5461,6 +5532,13 @@ class Service:
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
             declared_only=False) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
+        notice = getattr(self.tool_loop_guard, "notice", None)
+        self.tool_loop_guard.notice = None
+        if notice:
+            yield "event", Event("content", notice)
+            yield "done", {"finish": "stop", "completion_tokens": 0, "reused": 0, "timings": None,
+                           "reasoning_tokens": 0}
+            return
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
@@ -7839,7 +7917,8 @@ def make_handler(svc: Service):
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
-            svc.load()
+            if tool_loop_notice(messages, svc.tool_loop_max_repeats) is None:
+                svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             # No cap of our own on the reply's length when logprobs are asked for: the reply is already bounded by
             # max_tokens (by the rest of the context when it is not sent), which is the only bound OpenAI and vLLM
@@ -8062,7 +8141,8 @@ def make_handler(svc: Service):
                 check_request_sampling(req)                   # the request is also the sampling dict (see below)
             except ValueError as e:                           # its message starts with the field's name: the param
                 raise ResponsesError(str(e), str(e).partition(":")[0]) from None
-            svc.load()
+            if tool_loop_notice(messages, svc.tool_loop_max_repeats) is None:
+                svc.load()
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
@@ -8100,7 +8180,8 @@ def make_handler(svc: Service):
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
 
         def _anthropic(self, req):
-            svc.load()
+            if not svc.tool_loop_max_repeats:
+                svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
@@ -8111,6 +8192,8 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
+            if svc.tool_loop_max_repeats and tool_loop_notice(messages, svc.tool_loop_max_repeats) is None:
+                svc.load()
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
@@ -9428,6 +9511,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
+    try:
+        svc.tool_loop_max_repeats = tool_loop_max_repeats_from_config(cfg)
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}") from None
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         svc.reasoning_budget_configured = True
